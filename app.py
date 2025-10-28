@@ -1,5 +1,6 @@
 # app.py
-import os, json
+import os
+import json
 import random
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
@@ -7,45 +8,11 @@ from typing import List, Dict, Any, Tuple
 import streamlit as st
 from openai import OpenAI, APIStatusError, RateLimitError
 
-try:
-    from supabase import create_client, Client
-except Exception as e:
-    # Graceful fallback so you see a friendly message instead of NameError
-    st.error("Supabase client is missing. Ensure `supabase>=2.5` is in requirements.txt and redeploy.")
-    st.exception(e)
-    create_client = None
-    Client = None
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
-
-def get_user_id() -> str:
-    # Streamlit Community Cloud doesn’t auto-identify users.
-    # Quick workaround: ask for a name/email once and keep it in session.
-    # (Or implement your own login form.)
-    if "user_id" not in st.session_state:
-        st.session_state.user_id = st.sidebar.text_input("Your name/email (for saving):", key="uid_input") or ""
-    return st.session_state.user_id
-
-def load_store(user_id: str) -> dict:
-    if not sb or not user_id: return {}
-    res = sb.table("subject_store").select("payload").eq("user_id", user_id).execute()
-    return (res.data[0]["payload"] if res.data else {})
-
-def save_store(user_id: str, payload: dict):
-    if not sb or not user_id: return
-    sb.table("subject_store").upsert({"user_id": user_id, "payload": payload}).execute()
-
-# -----------------------------
-# App config
-# -----------------------------
+# ---------- App config ----------
 st.set_page_config(page_title="Question Randomizer", page_icon="🎲")
 st.title("🎲 Course Question Randomizer")
 
-# -----------------------------
-# OpenAI client (reads OPENAI_API_KEY from env)
-# -----------------------------
+# ---------- OpenAI client ----------
 client = OpenAI()
 
 SYSTEM_PROMPT = (
@@ -68,16 +35,13 @@ SYSTEM_PROMPT = (
 )
 
 def extract_questions_from_pdf(file_bytes: bytes, filename: str) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Uploads the PDF bytes to OpenAI Files, asks the model to extract questions as strict JSON,
-    returns (list_of_questions, raw_model_text).
-    """
+    """Uploads PDF to OpenAI Files, asks model to extract questions as strict JSON."""
     pdf_io = BytesIO(file_bytes)
     pdf_io.name = filename
     up = client.files.create(file=pdf_io, purpose="user_data")
 
     resp = client.responses.create(
-        model="gpt-5-mini",  # cheaper; switch to "gpt-5" for higher quality
+        model="gpt-5-mini",  # switch to "gpt-5" for higher quality
         input=[
             {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
             {"role": "user", "content": [
@@ -92,8 +56,7 @@ def extract_questions_from_pdf(file_bytes: bytes, filename: str) -> Tuple[List[D
         try:
             return json.loads(s)
         except json.JSONDecodeError:
-            start = s.find("{")
-            end = s.rfind("}")
+            start = s.find("{"); end = s.rfind("}")
             if start != -1 and end != -1 and end > start:
                 return json.loads(s[start:end+1])
             raise
@@ -101,77 +64,122 @@ def extract_questions_from_pdf(file_bytes: bytes, filename: str) -> Tuple[List[D
     data = try_parse_json(text)
     questions = data.get("questions", [])
 
-    # Normalize indices if missing
+    # Normalize indices & text
     for i, q in enumerate(questions, start=1):
         if not isinstance(q.get("index"), int):
             q["index"] = i
-        # standardize keys
-        q["question_text"] = str(q.get("question_text", "")).strip()
-        if not q["question_text"]:
-            q["question_text"] = "(empty question text)"
-
+        q["question_text"] = str(q.get("question_text", "")).strip() or "(empty question text)"
     return questions, text
 
-# -----------------------------
-# Session state init
-# -----------------------------
+
+# ---------- Persistence (Supabase) ----------
+try:
+    from supabase import create_client, Client
+except Exception:
+    create_client = None
+    Client = None
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+sb: "Client | None" = (
+    create_client(SUPABASE_URL, SUPABASE_KEY)
+    if (create_client and SUPABASE_URL and SUPABASE_KEY) else None
+)
+
+def serialize_store(store: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert sets -> lists so JSON is valid."""
+    out = {}
+    for subj, payload in store.items():
+        out[subj] = {
+            "questions": payload.get("questions", []),
+            "used": sorted(list(payload.get("used", set()))),
+            "raw_log": payload.get("raw_log", []),
+        }
+    return out
+
+def deserialize_store(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert lists -> sets; ensure structure."""
+    out = {}
+    for subj, p in (payload or {}).items():
+        used_list = p.get("used", [])
+        out[subj] = {
+            "questions": p.get("questions", []),
+            "used": set(used_list if isinstance(used_list, list) else []),
+            "raw_log": p.get("raw_log", []),
+        }
+    return out
+
+def load_store(user_id: str) -> Dict[str, Any]:
+    if not (sb and user_id): return {}
+    res = sb.table("subject_store").select("payload").eq("user_id", user_id).execute()
+    return deserialize_store(res.data[0]["payload"]) if res.data else {}
+
+def save_store(user_id: str, store: Dict[str, Any]) -> None:
+    if not (sb and user_id): return
+    sb.table("subject_store").upsert({
+        "user_id": user_id,
+        "payload": serialize_store(store)
+    }).execute()
+
+# ---------- Session state ----------
 if "subjects" not in st.session_state:
     # subjects: { name: {"questions":[...], "used": set(indices), "raw_log":[raw_json_str,...]} }
     st.session_state.subjects = {}
 if "current_subject" not in st.session_state:
     st.session_state.current_subject = None
+if "loaded_from_db" not in st.session_state:
+    st.session_state.loaded_from_db = False
+if "user_id" not in st.session_state:
+    st.session_state.user_id = ""
 
-uid = get_user_id()  # shows the sidebar input
-if uid and not st.session_state.subjects:
-    try:
-        persisted = load_store(uid)
-        if isinstance(persisted, dict):
-            st.session_state.subjects = persisted
-    except Exception as e:
-        st.warning("Could not load your saved subjects yet.")
-
-# -----------------------------
-# Sidebar: Subject management
-# -----------------------------
+# ---------- Sidebar: identity + subject mgmt ----------
 with st.sidebar:
-    st.header("📚 Subjects")
+    st.header("👤 User")
+    st.session_state.user_id = st.text_input(
+        "Your name/email (to save your data):",
+        value=st.session_state.user_id,
+        placeholder="e.g., alice@nus.edu.sg"
+    ).strip()
 
-    # Ensure state exists
-    if "subjects" not in st.session_state:
-        st.session_state.subjects = {}
-    if "current_subject" not in st.session_state:
-        st.session_state.current_subject = None
+    if not st.session_state.loaded_from_db and st.session_state.user_id:
+        # initial load for this user
+        try:
+            st.session_state.subjects = load_store(st.session_state.user_id) or {}
+        except Exception as e:
+            st.warning("Could not load your saved subjects yet.")
+        st.session_state.loaded_from_db = True
+
+    st.header("📚 Subjects")
     if "new_subject_name" not in st.session_state:
         st.session_state.new_subject_name = ""
 
-    # Helpers (callbacks)
+    def persist_now():
+        if st.session_state.user_id:
+            save_store(st.session_state.user_id, st.session_state.subjects)
+
+    # Callbacks
     def create_subject_cb():
         name = (st.session_state.new_subject_name or "").strip()
         if not name:
-            st.session_state._flash = ("error", "Please enter a subject name.")
-            return
+            st.session_state._flash = ("error", "Please enter a subject name."); return
         if name in st.session_state.subjects:
-            st.session_state._flash = ("warning", "That subject already exists.")
-            return
+            st.session_state._flash = ("warning", "That subject already exists."); return
         st.session_state.subjects[name] = {"questions": [], "used": set(), "raw_log": []}
         st.session_state.current_subject = name
-        # Clear the input safely inside the callback
         st.session_state.new_subject_name = ""
-        if uid:
-            save_store(uid, st.session_state.subjects)
+        persist_now()
         st.rerun()
 
     def delete_current_subject_cb():
         cur = st.session_state.current_subject
         if cur and cur in st.session_state.subjects:
             del st.session_state.subjects[cur]
-            if uid:
-                save_store(uid, st.session_state.subjects)
             st.session_state.current_subject = None
             st.session_state._flash = ("success", "Subject deleted.")
+            persist_now()
             st.rerun()
 
-    # Subject picker
+    # Picker
     subject_names = sorted(st.session_state.subjects.keys())
     options = ["(none)"] + subject_names
     default = st.session_state.current_subject if st.session_state.current_subject in subject_names else "(none)"
@@ -180,38 +188,29 @@ with st.sidebar:
 
     st.divider()
     st.caption("Create a new subject")
-
-    # Plain input + button (no form → no overlay text)
-    st.text_input(
-        "New subject name",
-        key="new_subject_name",
-        placeholder="e.g., Calculus, Signals, EE2028",
-        help="Type a name, then click Create Subject."
-    )
+    st.text_input("New subject name", key="new_subject_name",
+                  placeholder="e.g., Calculus, Signals, EE2028",
+                  help="Type a name, then click Create Subject.")
     st.button("➕ Create Subject", use_container_width=True, on_click=create_subject_cb)
 
     if st.session_state.current_subject:
-        st.write("")  # tiny spacer
+        st.write("")  # spacer
         st.button("🗑️ Delete Current Subject", use_container_width=True, type="secondary", on_click=delete_current_subject_cb)
 
-    # Flash messages (optional)
+    # Manual Save button (optional)
+    if st.button("💾 Save now", use_container_width=True, disabled=not st.session_state.user_id):
+        persist_now()
+        st.success("Saved.")
+
+    # Flash messages
     if "_flash" in st.session_state:
         level, msg = st.session_state._flash
-        if level == "error":
-            st.error(msg)
-        elif level == "warning":
-            st.warning(msg)
-        else:
-            st.success(msg)
+        {"error": st.error, "warning": st.warning}.get(level, st.success)(msg)
         del st.session_state._flash
 
-# -----------------------------
-# Main area: Upload, Extract, Randomize
-# -----------------------------
-st.markdown(
-    "Upload a PDF containing questions and extract them **into the selected subject**. "
-    "Then draw a random practice question from that subject."
-)
+# ---------- Main: Upload, Extract, Randomize ----------
+st.markdown("Upload a PDF containing questions and extract them **into the selected subject**. "
+            "Then draw a random practice question from that subject.")
 
 if st.session_state.current_subject is None:
     st.warning("Select or create a subject from the sidebar to begin.")
@@ -238,7 +237,6 @@ else:
                 if not qs:
                     st.warning("I didn't find any questions. Try another PDF or check its formatting.")
                 else:
-                    # Append to this subject's pool; reindex to keep stable display order
                     offset = len(store["questions"])
                     for i, q in enumerate(qs, start=1):
                         store["questions"].append({
@@ -247,21 +245,18 @@ else:
                             "page_range": q.get("page_range")
                         })
                     store["raw_log"].append(raw)
-                    if uid:
-                        save_store(uid, st.session_state.subjects)
                     st.success(f"Added {len(qs)} question(s) to {subj}. Total now: {len(store['questions'])}.")
+                    # persist
+                    if st.session_state.user_id:
+                        save_store(st.session_state.user_id, st.session_state.subjects)
             except RateLimitError as e:
-                st.error("Rate/quota limit—check billing/usage.")
-                st.code(str(e))
+                st.error("Rate/quota limit—check billing/usage."); st.code(str(e))
             except APIStatusError as e:
-                st.error(f"API error {e.status_code}.")
-                st.code(e.message)
+                st.error(f"API error {e.status_code}."); st.code(e.message)
             except Exception as e:
-                st.error("Unexpected error during extraction.")
-                st.code(repr(e))
+                st.error("Unexpected error during extraction."); st.code(repr(e))
 
     if random_btn and store["questions"]:
-        # Draw without repeats until exhausted
         all_idxs = list(range(len(store["questions"])))
         unused = [i for i in all_idxs if i not in store["used"]]
         if not unused:
@@ -273,22 +268,24 @@ else:
             st.subheader(f"🎯 Your practice question (Subject: {subj})")
             st.markdown(f"**Q{q['index']}**" + (f"  _(pages {q['page_range']})_" if q.get("page_range") else ""))
             st.text(q["question_text"])
+            # persist draw state
+            if st.session_state.user_id:
+                save_store(st.session_state.user_id, st.session_state.subjects)
 
     if reset_btn:
         store["used"] = set()
-        if uid:
-            save_store(uid, st.session_state.subjects)
         st.success("Draw history reset for this subject.")
+        if st.session_state.user_id:
+            save_store(st.session_state.user_id, st.session_state.subjects)
 
     if clear_btn:
         store["questions"] = []
         store["used"] = set()
         store["raw_log"] = []
-        if uid:
-            save_store(uid, st.session_state.subjects)
         st.success("Cleared all questions for this subject.")
+        if st.session_state.user_id:
+            save_store(st.session_state.user_id, st.session_state.subjects)
 
-    # Preview
     if store["questions"]:
         with st.expander(f"📄 Preview questions in {subj} ({len(store['questions'])})"):
             for q in store["questions"]:
@@ -299,5 +296,3 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
-
-
