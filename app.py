@@ -274,7 +274,7 @@ else:
 
     colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
-    extract_btn = st.button("📥 Extract", use_container_width=True, disabled=(not uploaded_files or len(uploaded_files) == 0))
+        extract_btn = st.button("📥 Extract", use_container_width=True, disabled=(not uploaded_files or len(uploaded_files) == 0))
     with colB:
         random_btn = st.button("🎲 Randomize one", use_container_width=True, disabled=(len(store["questions"]) == 0))
     with colC:
@@ -362,4 +362,5 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
+
 
