@@ -1,11 +1,33 @@
 # app.py
-import json
+import os, json
 import random
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from openai import OpenAI, APIStatusError, RateLimitError
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+def get_user_id() -> str:
+    # Streamlit Community Cloud doesn’t auto-identify users.
+    # Quick workaround: ask for a name/email once and keep it in session.
+    # (Or implement your own login form.)
+    import streamlit as st
+    if "user_id" not in st.session_state:
+        st.session_state.user_id = st.sidebar.text_input("Your name/email (for saving):", key="uid_input") or ""
+    return st.session_state.user_id
+
+def load_store(user_id: str) -> dict:
+    if not sb or not user_id: return {}
+    res = sb.table("subject_store").select("payload").eq("user_id", user_id).execute()
+    return (res.data[0]["payload"] if res.data else {})
+
+def save_store(user_id: str, payload: dict):
+    if not sb or not user_id: return
+    sb.table("subject_store").upsert({"user_id": user_id, "payload": payload}).execute()
 
 # -----------------------------
 # App config
@@ -91,6 +113,15 @@ if "subjects" not in st.session_state:
 if "current_subject" not in st.session_state:
     st.session_state.current_subject = None
 
+uid = get_user_id()  # shows the sidebar input
+if uid and not st.session_state.subjects:
+    try:
+        persisted = load_store(uid)
+        if isinstance(persisted, dict):
+            st.session_state.subjects = persisted
+    except Exception as e:
+        st.warning("Could not load your saved subjects yet.")
+
 # -----------------------------
 # Sidebar: Subject management
 # -----------------------------
@@ -118,13 +149,16 @@ with st.sidebar:
         st.session_state.current_subject = name
         # Clear the input safely inside the callback
         st.session_state.new_subject_name = ""
-        # Force a clean rerender so the cleared value shows
+        if uid:
+            save_store(uid, st.session_state.subjects)
         st.rerun()
 
     def delete_current_subject_cb():
         cur = st.session_state.current_subject
         if cur and cur in st.session_state.subjects:
             del st.session_state.subjects[cur]
+            if uid:
+                save_store(uid, st.session_state.subjects)
             st.session_state.current_subject = None
             st.session_state._flash = ("success", "Subject deleted.")
             st.rerun()
@@ -205,6 +239,8 @@ else:
                             "page_range": q.get("page_range")
                         })
                     store["raw_log"].append(raw)
+                    if uid:
+                        save_store(uid, st.session_state.subjects)
                     st.success(f"Added {len(qs)} question(s) to {subj}. Total now: {len(store['questions'])}.")
             except RateLimitError as e:
                 st.error("Rate/quota limit—check billing/usage.")
@@ -232,12 +268,16 @@ else:
 
     if reset_btn:
         store["used"] = set()
+        if uid:
+            save_store(uid, st.session_state.subjects)
         st.success("Draw history reset for this subject.")
 
     if clear_btn:
         store["questions"] = []
         store["used"] = set()
         store["raw_log"] = []
+        if uid:
+            save_store(uid, st.session_state.subjects)
         st.success("Cleared all questions for this subject.")
 
     # Preview
@@ -251,3 +291,4 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
+
