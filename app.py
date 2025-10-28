@@ -7,6 +7,15 @@ from typing import List, Dict, Any, Tuple
 import streamlit as st
 from openai import OpenAI, APIStatusError, RateLimitError
 
+try:
+    from supabase import create_client, Client
+except Exception as e:
+    # Graceful fallback so you see a friendly message instead of NameError
+    st.error("Supabase client is missing. Ensure `supabase>=2.5` is in requirements.txt and redeploy.")
+    st.exception(e)
+    create_client = None
+    Client = None
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
@@ -15,7 +24,6 @@ def get_user_id() -> str:
     # Streamlit Community Cloud doesn’t auto-identify users.
     # Quick workaround: ask for a name/email once and keep it in session.
     # (Or implement your own login form.)
-    import streamlit as st
     if "user_id" not in st.session_state:
         st.session_state.user_id = st.sidebar.text_input("Your name/email (for saving):", key="uid_input") or ""
     return st.session_state.user_id
@@ -291,4 +299,5 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
+
 
