@@ -270,11 +270,11 @@ else:
     subj = st.session_state.current_subject
     store = st.session_state.subjects[subj]
 
-    uploaded = st.file_uploader(f"Upload PDF to add questions to **{subj}**", type=["pdf"], key=f"uploader_{subj}")
+    uploaded_files = st.file_uploader(f"Upload PDF(s) to add questions to **{subj}**",type=["pdf"],accept_multiple_files=True,key=f"uploader_{subj}")
 
     colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
-        extract_btn = st.button("📥 Extract", use_container_width=True, disabled=(uploaded is None))
+    extract_btn = st.button("📥 Extract", use_container_width=True, disabled=(not uploaded_files or len(uploaded_files) == 0))
     with colB:
         random_btn = st.button("🎲 Randomize one", use_container_width=True, disabled=(len(store["questions"]) == 0))
     with colC:
@@ -282,30 +282,45 @@ else:
     with colD:
         clear_btn = st.button("🧹 Clear questions", use_container_width=True, disabled=(len(store["questions"]) == 0))
 
-    if extract_btn and uploaded is not None:
-        with st.spinner(f"Extracting questions into {subj}…"):
-            try:
-                qs, raw = extract_questions_from_pdf(uploaded.read(), uploaded.name)
+    if extract_btn and uploaded_files:
+    with st.spinner(f"Extracting from {len(uploaded_files)} file(s) into {subj}…"):
+        total_new = 0
+        per_file_counts = []
+        try:
+            for upf in uploaded_files:
+                qs, raw = extract_questions_from_pdf(upf.read(), upf.name)
                 if not qs:
-                    st.warning("I didn't find any questions. Try another PDF or check its formatting.")
-                else:
-                    offset = len(store["questions"])
-                    for i, q in enumerate(qs, start=1):
-                        store["questions"].append({
-                            "index": offset + i,
-                            "question_text": q.get("question_text", ""),
-                            "page_range": q.get("page_range")
-                        })
-                    store["raw_log"].append(raw)
-                    st.success(f"Added {len(qs)} question(s) to {subj}. Total now: {len(store['questions'])}.")
-                    if st.session_state.user_id:
-                        save_store(st.session_state.user_id, st.session_state.subjects)
-            except RateLimitError as e:
-                st.error("Rate/quota limit—check billing/usage."); st.code(str(e))
-            except APIStatusError as e:
-                st.error(f"API error {e.status_code}."); st.code(e.message)
-            except Exception as e:
-                st.error("Unexpected error during extraction."); st.code(repr(e))
+                    per_file_counts.append((upf.name, 0))
+                    continue
+                offset = len(store["questions"])
+                for i, q in enumerate(qs, start=1):
+                    store["questions"].append({
+                        "index": offset + i,
+                        "question_text": q.get("question_text", ""),
+                        "page_range": q.get("page_range")
+                    })
+                store["raw_log"].append(raw)
+                per_file_counts.append((upf.name, len(qs)))
+                total_new += len(qs)
+
+            if total_new == 0:
+                st.warning("I didn't find any questions in the selected file(s). Try other PDFs or check formatting.")
+            else:
+                # Nice summary + per-file breakdown
+                st.success(f"Added {total_new} question(s) to {subj}. Total now: {len(store['questions'])}.")
+                for fname, cnt in per_file_counts:
+                    st.caption(f"• {fname}: {cnt} question(s)")
+
+                # persist once after all files processed
+                if st.session_state.user_id:
+                    save_store(st.session_state.user_id, st.session_state.subjects)
+
+        except RateLimitError as e:
+            st.error("Rate/quota limit—check billing/usage."); st.code(str(e))
+        except APIStatusError as e:
+            st.error(f"API error {e.status_code}."); st.code(e.message)
+        except Exception as e:
+            st.error("Unexpected error during extraction."); st.code(repr(e))
 
     if random_btn and store["questions"]:
         all_idxs = list(range(len(store["questions"])))
@@ -347,3 +362,4 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
+
