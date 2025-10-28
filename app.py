@@ -18,7 +18,7 @@ client = OpenAI()
 SYSTEM_PROMPT = (
     "You are a precise extraction assistant. "
     "You will read an attached PDF that contains multiple course questions. "
-    "Extract ONLY the question prompts, not answers or solutions. "
+    "Extract ONLY the question prompts, not note teaching contents, answers, or solutions. "
     "If questions have subparts (a), (b), (c), keep them attached to the same question text. "
     "Ignore answer keys, marking schemes, prefaces, or unrelated text. "
     "Return STRICT JSON with the following schema (no extra commentary):\n\n"
@@ -296,3 +296,4 @@ else:
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
+
