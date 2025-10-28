@@ -2,23 +2,28 @@
 import os
 import json
 import random
+import re
 from io import BytesIO
 from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 from openai import OpenAI, APIStatusError, RateLimitError
 
-# ---------- App config ----------
+# =========================
+# App config
+# =========================
 st.set_page_config(page_title="Question Randomizer", page_icon="🎲")
 st.title("🎲 Course Question Randomizer")
 
-# ---------- OpenAI client ----------
+# =========================
+# OpenAI client
+# =========================
 client = OpenAI()
 
 SYSTEM_PROMPT = (
     "You are a precise extraction assistant. "
     "You will read an attached PDF that contains multiple course questions. "
-    "Extract ONLY the question prompts, not note teaching contents, answers, or solutions. "
+    "Extract ONLY the question prompts, not answers or solutions. "
     "If questions have subparts (a), (b), (c), keep them attached to the same question text. "
     "Ignore answer keys, marking schemes, prefaces, or unrelated text. "
     "Return STRICT JSON with the following schema (no extra commentary):\n\n"
@@ -31,11 +36,12 @@ SYSTEM_PROMPT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "Ensure all newlines in question_text are preserved where helpful, but keep valid JSON."
+    "Ensure all newlines in question_text are preserved where helpful, but keep valid JSON. "
+    "Preserve logical symbols (¬, ∧, ∨, →, ↔) as Unicode in the output."
 )
 
 def extract_questions_from_pdf(file_bytes: bytes, filename: str) -> Tuple[List[Dict[str, Any]], str]:
-    """Uploads PDF to OpenAI Files, asks model to extract questions as strict JSON."""
+    """Upload PDF to OpenAI Files and ask the model to extract questions as strict JSON."""
     pdf_io = BytesIO(file_bytes)
     pdf_io.name = filename
     up = client.files.create(file=pdf_io, purpose="user_data")
@@ -63,16 +69,62 @@ def extract_questions_from_pdf(file_bytes: bytes, filename: str) -> Tuple[List[D
 
     data = try_parse_json(text)
     questions = data.get("questions", [])
-
-    # Normalize indices & text
     for i, q in enumerate(questions, start=1):
         if not isinstance(q.get("index"), int):
             q["index"] = i
         q["question_text"] = str(q.get("question_text", "")).strip() or "(empty question text)"
     return questions, text
 
+# =========================
+# Math / logic rendering
+# =========================
+# Mapping only used when user opts into LaTeX prettifying
+_LOGIC_TO_LATEX = {
+    "¬": r"\lnot",
+    "∧": r"\land",
+    "∨": r"\lor",
+    "→": r"\to",
+    "↔": r"\leftrightarrow",
+    "⊕": r"\oplus",
+    "⊤": r"\top",
+    "⊥": r"\bot",
+    "≥": r"\ge",
+    "≤": r"\le",
+    "≠": r"\ne",
+    "∀": r"\forall",
+    "∃": r"\exists",
+}
+_TEX_INLINE = re.compile(r"(\$.*?\$|\\\(.+?\\\)|\\\[.+?\\\])")
 
-# ---------- Persistence (Supabase) ----------
+def _force_logic_to_latex(line: str) -> str:
+    out = line
+    for sym, latex in _LOGIC_TO_LATEX.items():
+        out = out.replace(sym, latex)
+    return f"${out}$"
+
+def render_question_md(text: str, mode: str):
+    """
+    - If a line already contains TeX ($...$, \(...\), \[...\]) → render as-is (Markdown/MathJax).
+    - Else:
+        * Auto (Unicode): render as plain Markdown (Unicode symbols shown directly).
+        * Force LaTeX for logic symbols: map common logic ops to LaTeX and wrap in $...$.
+    """
+    for raw_line in (text.splitlines() or [text]):
+        line = raw_line.strip()
+        if not line:
+            st.markdown("&nbsp;")
+            continue
+
+        if _TEX_INLINE.search(line):
+            st.markdown(line)
+        elif mode == "Force LaTeX for logic symbols" and any(ch in line for ch in _LOGIC_TO_LATEX):
+            st.markdown(_force_logic_to_latex(line))
+        else:
+            st.markdown(line)
+
+# =========================
+# Persistence (Supabase)
+# =========================
 try:
     from supabase import create_client, Client
 except Exception:
@@ -121,9 +173,11 @@ def save_store(user_id: str, store: Dict[str, Any]) -> None:
         "payload": serialize_store(store)
     }).execute()
 
-# ---------- Session state ----------
+# =========================
+# Session state
+# =========================
 if "subjects" not in st.session_state:
-    # subjects: { name: {"questions":[...], "used": set(indices), "raw_log":[raw_json_str,...]} }
+    # { name: {"questions":[...], "used": set(indices), "raw_log":[raw_json_str,...]} }
     st.session_state.subjects = {}
 if "current_subject" not in st.session_state:
     st.session_state.current_subject = None
@@ -132,7 +186,9 @@ if "loaded_from_db" not in st.session_state:
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
 
-# ---------- Sidebar: identity + subject mgmt ----------
+# =========================
+# Sidebar: identity, math mode, subjects
+# =========================
 with st.sidebar:
     st.header("👤 User")
     st.session_state.user_id = st.text_input(
@@ -141,13 +197,20 @@ with st.sidebar:
         placeholder="e.g., alice@nus.edu.sg"
     ).strip()
 
+    # One-time load from DB after user_id is provided
     if not st.session_state.loaded_from_db and st.session_state.user_id:
-        # initial load for this user
         try:
             st.session_state.subjects = load_store(st.session_state.user_id) or {}
-        except Exception as e:
+        except Exception:
             st.warning("Could not load your saved subjects yet.")
         st.session_state.loaded_from_db = True
+
+    st.header("ƒ Rendering")
+    render_mode = st.selectbox(
+        "Math rendering",
+        ["Auto (Unicode)", "Force LaTeX for logic symbols"],
+        help="Unicode shows symbols directly. LaTeX mode prettifies common logic operators."
+    )
 
     st.header("📚 Subjects")
     if "new_subject_name" not in st.session_state:
@@ -197,20 +260,22 @@ with st.sidebar:
         st.write("")  # spacer
         st.button("🗑️ Delete Current Subject", use_container_width=True, type="secondary", on_click=delete_current_subject_cb)
 
-    # Manual Save button (optional)
     if st.button("💾 Save now", use_container_width=True, disabled=not st.session_state.user_id):
         persist_now()
         st.success("Saved.")
 
-    # Flash messages
     if "_flash" in st.session_state:
         level, msg = st.session_state._flash
         {"error": st.error, "warning": st.warning}.get(level, st.success)(msg)
         del st.session_state._flash
 
-# ---------- Main: Upload, Extract, Randomize ----------
-st.markdown("Upload a PDF containing questions and extract them **into the selected subject**. "
-            "Then draw a random practice question from that subject.")
+# =========================
+# Main: upload, extract, randomize
+# =========================
+st.markdown(
+    "Upload a PDF containing questions and extract them **into the selected subject**. "
+    "Then draw a random practice question from that subject."
+)
 
 if st.session_state.current_subject is None:
     st.warning("Select or create a subject from the sidebar to begin.")
@@ -220,7 +285,7 @@ else:
 
     uploaded = st.file_uploader(f"Upload PDF to add questions to **{subj}**", type=["pdf"], key=f"uploader_{subj}")
 
-    colA, colB, colC, colD = st.columns([1,1,1,1])
+    colA, colB, colC, colD = st.columns([1, 1, 1, 1])
     with colA:
         extract_btn = st.button("📥 Extract", use_container_width=True, disabled=(uploaded is None))
     with colB:
@@ -246,7 +311,6 @@ else:
                         })
                     store["raw_log"].append(raw)
                     st.success(f"Added {len(qs)} question(s) to {subj}. Total now: {len(store['questions'])}.")
-                    # persist
                     if st.session_state.user_id:
                         save_store(st.session_state.user_id, st.session_state.subjects)
             except RateLimitError as e:
@@ -267,8 +331,7 @@ else:
             q = store["questions"][pick]
             st.subheader(f"🎯 Your practice question (Subject: {subj})")
             st.markdown(f"**Q{q['index']}**" + (f"  _(pages {q['page_range']})_" if q.get("page_range") else ""))
-            st.text(q["question_text"])
-            # persist draw state
+            render_question_md(q["question_text"], render_mode)
             if st.session_state.user_id:
                 save_store(st.session_state.user_id, st.session_state.subjects)
 
@@ -290,10 +353,9 @@ else:
         with st.expander(f"📄 Preview questions in {subj} ({len(store['questions'])})"):
             for q in store["questions"]:
                 st.markdown(f"**Q{q['index']}**" + (f"  _(pages {q['page_range']})_" if q.get("page_range") else ""))
-                st.text(q["question_text"])
+                render_question_md(q["question_text"], render_mode)
                 st.markdown("---")
 
 st.markdown("---")
 st.caption("Tip: Each subject keeps its own question pool and draw history. "
            "Add more PDFs to grow a subject, or create new subjects for other modules.")
-
